@@ -140,7 +140,10 @@ def draw_header(c, text, x, y, width):
     c.drawCentredString(x + width/2, y + CARD_HEIGHT - 4*mm, text)
 
 def draw_front_indicator(c, x, y, width):
-    c.setFont(FONT_NORMAL, 10)
+    if HAS_NOTO:
+        c.setFont('NotoSymbols', 10)
+    else:
+        c.setFont(FONT_NORMAL, 10)
     c.setFillColor(colors.grey)
     c.drawCentredString(x + width/2, y + 2*mm, "★")
 
@@ -200,6 +203,9 @@ def create_pdf(cards, output_file):
             
             x = MARGIN + col * CARD_WIDTH
             y = PAGE_HEIGHT - MARGIN - (row + 1) * CARD_HEIGHT
+            
+            c.setStrokeColor(colors.lightgrey)
+            c.rect(x, y, CARD_WIDTH, CARD_HEIGHT)
             
             draw_text_fitted(c, card['answer'], x, y, CARD_WIDTH, CARD_HEIGHT - 5*mm)
  
