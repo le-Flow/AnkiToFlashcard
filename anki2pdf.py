@@ -10,6 +10,26 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.lib.utils import ImageReader
+import re
+import hashlib
+import matplotlib.pyplot as plt
+from matplotlib import rcParams
+import matplotlib.font_manager as fm
+
+
+# Register fonts
+fm.fontManager.addfont('/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf')
+fm.fontManager.addfont('/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf')
+fm.fontManager.addfont('/usr/share/fonts/truetype/noto/NotoSans-Italic.ttf')
+fm.fontManager.addfont('/usr/share/fonts/truetype/noto/NotoSans-BoldItalic.ttf')
+
+
+MATH_CACHE_DIR = "math_cache"
+if not os.path.exists(MATH_CACHE_DIR):
+    os.makedirs(MATH_CACHE_DIR)
+
+MATH_SCALE_FACTOR = None
 
 try:
     pdfmetrics.registerFont(TTFont('NotoSans', '/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf'))
@@ -17,7 +37,15 @@ try:
     
     pdfmetrics.registerFont(TTFont('NotoSymbols', '/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf'))
     pdfmetrics.registerFont(TTFont('NotoSymbols2', '/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf'))
-    
+
+    LATEX_REPLACEMENTS = {} 
+
+    # Configure MatplotLib to use NotoSans for Math
+    rcParams['mathtext.fontset'] = 'custom'
+    rcParams['mathtext.rm'] = 'Noto Sans'
+    rcParams['mathtext.it'] = 'Noto Sans:italic'
+    rcParams['mathtext.bf'] = 'Noto Sans:bold'
+
     FONT_NORMAL = 'NotoSans'
     FONT_BOLD = 'NotoSans-Bold'
     HAS_NOTO = True
@@ -26,6 +54,75 @@ except:
     FONT_NORMAL = 'Helvetica'
     FONT_BOLD = 'Helvetica-Bold'
     HAS_NOTO = False
+    rcParams['mathtext.fontset'] = 'stixsans'
+
+def clean_latex_for_matplotlib(latex):
+    # \le -> \leq
+    latex = re.sub(r'\\le(?=[^a-zA-Z]|$)', r'\\leq', latex)
+    # \ge -> \geq
+    latex = re.sub(r'\\ge(?=[^a-zA-Z]|$)', r'\\geq', latex)
+    return latex
+
+def render_latex_local(latex, cache_dir=MATH_CACHE_DIR):
+    latex = clean_latex_for_matplotlib(latex)
+    latex_hash = hashlib.md5(latex.encode('utf-8')).hexdigest()
+    image_path = os.path.join(cache_dir, f"{latex_hash}.png")
+    
+    if os.path.exists(image_path):
+        return image_path
+        
+    try:
+        fig = plt.figure(figsize=(0.01, 0.01))
+        
+        # Render text
+        text = f"${latex}$"
+        
+        fig.text(0, 0, text, fontsize=40)
+        
+        # Save to buffer/file with bounding box tight
+        bbox = fig.get_window_extent().transformed(fig.dpi_scale_trans.inverted())
+        
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        canvas = FigureCanvasAgg(fig)
+        
+        fig.clf()
+        fig.patch.set_alpha(0)
+        
+        # Use simple text rendering
+        t = fig.text(0.5, 0.5, text, fontsize=40, ha='center', va='center')
+        
+        # Save
+        # bbox_inches='tight' trims whitespace
+        fig.savefig(image_path, dpi=300, bbox_inches='tight', transparent=True, pad_inches=0.02)
+        plt.close(fig)
+        
+        return image_path
+    
+    except Exception as e:
+        print(f"Error rendering math locally for '{latex}': {e}")
+        plt.close(fig) if 'fig' in locals() else None
+        return None
+
+def get_math_scale():
+    global MATH_SCALE_FACTOR
+    if MATH_SCALE_FACTOR is not None:
+        return MATH_SCALE_FACTOR
+        
+    try:
+        image_path = render_latex_local("x")
+        if image_path:
+            img = ImageReader(image_path)
+            _, h_ref = img.getSize()
+            TARGET_X_HEIGHT = 18
+            MATH_SCALE_FACTOR = TARGET_X_HEIGHT / h_ref
+        else:
+            MATH_SCALE_FACTOR = 1.0 # Fallback
+    except Exception as e:
+        print(f"Error calculating math scale: {e}")
+        MATH_SCALE_FACTOR = 1.0
+        
+    print(f"Math scale factor: {MATH_SCALE_FACTOR}")
+    return MATH_SCALE_FACTOR
 
 def apply_font_fallback(text):
     if not HAS_NOTO:
@@ -86,9 +183,61 @@ def parse_anki_export(filepath):
                         
                     return text
 
+                def process_mathjax(text):
+                    # Regex for inline math \( ... \)
+                    pattern_inline = r'\\\((.*?)\\\)'
+                    # Regex for display math \[ ... \]
+                    pattern_display = r'\\\[(.*?)\\\]'
+                    
+                    math_scale = get_math_scale()
+                    
+                    def replace_math(match):
+                        latex = match.group(1).strip()
+                        if not latex:
+                            return ""
+                        
+                        image_path = render_latex_local(latex)
+                        if not image_path:
+                             return match.group(0) # Return original text on failure
+                        
+                        # Return image tag for ReportLab
+                        # Adjust valign to align with text
+                        try:
+                            img = ImageReader(image_path)
+                            iw, ih = img.getSize()
+                            
+                            target_width = iw * math_scale
+                            target_height = ih * math_scale
+                            
+                            # Constrain to card size
+                            max_img_width = CARD_WIDTH - 6*mm
+                            max_img_height = CARD_HEIGHT - 6*mm
+                            
+                            downscale = min(1.0, max_img_width / target_width, max_img_height / target_height)
+                            
+                            target_width *= downscale
+                            target_height *= downscale
+                            
+                            valign = -target_height/2 + 4 
+                            
+                            return f'<img src="{image_path}" valign="{valign}" width="{target_width}" height="{target_height}"/>'
+                        except Exception as e:
+                            print(f"Error reading image size: {e}")
+                            return match.group(0)
+
+                    # Process both patterns
+
+                    # Process both patterns
+                    text = re.sub(pattern_display, replace_math, text)
+                    text = re.sub(pattern_inline, replace_math, text)
+                    return text
+
                 question = sanitize_html(question)
                 answer = sanitize_html(answer)
                 
+                question = process_mathjax(question)
+                answer = process_mathjax(answer)
+
                 question = apply_font_fallback(question)
                 answer = apply_font_fallback(answer)
                 
@@ -147,9 +296,16 @@ def draw_front_indicator(c, x, y, width):
     c.setFillColor(colors.grey)
     c.drawCentredString(x + width/2, y + 2*mm, "★")
 
+def draw_page_number(c, page_bum, x, y):
+    c.setFont("Helvetica", 8)
+    c.setFillColor(colors.grey)
+    # Draw small page number at the bottom center of the page
+    c.drawCentredString(PAGE_WIDTH / 2, 3 * mm, f"{page_bum}")
+
 def create_pdf(cards, output_file):
     c = canvas.Canvas(output_file, pagesize=landscape(A4))
     
+    page_num = 1
     for i in range(0, len(cards), CARDS_PER_PAGE):
         chunk = cards[i : i + CARDS_PER_PAGE]
         
@@ -168,9 +324,12 @@ def create_pdf(cards, output_file):
             
             draw_front_indicator(c, x, y, CARD_WIDTH)
             
+            
             draw_text_fitted(c, card['question'], x, y, CARD_WIDTH, CARD_HEIGHT - 5*mm)
             
+        draw_page_number(c, page_num, 0, 0)
         c.showPage()
+        page_num += 1
         
         # Back Side
         # Mirroring logic:
@@ -209,7 +368,9 @@ def create_pdf(cards, output_file):
             
             draw_text_fitted(c, card['answer'], x, y, CARD_WIDTH, CARD_HEIGHT - 5*mm)
  
+        draw_page_number(c, page_num, 0, 0)
         c.showPage()
+        page_num += 1
 
     c.save()
     print(f"PDF created: {output_file}")
